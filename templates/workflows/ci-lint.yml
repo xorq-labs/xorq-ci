@@ -1,0 +1,24 @@
+# xorq-ci: managed templates/workflows/ci-lint.yml
+#
+# Runs this repo's .pre-commit-config.yaml in CI. Copy with:
+#   xorq-ci-drift copy templates/workflows/ci-lint.yml .github/workflows/ci-lint.yml
+# Need inputs (pre-steps, skip-hooks, python-version)? Add a `with:` block and
+# change "managed" above to "forked".
+name: ci-lint
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  lint:
+    uses: xorq-labs/xorq-ci/.github/workflows/lint.yml@XORQ_CI_SHA # XORQ_CI_TAG

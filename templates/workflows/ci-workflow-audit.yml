@@ -1,0 +1,23 @@
+# xorq-ci: managed templates/workflows/ci-workflow-audit.yml
+#
+# Checks copied xorq-ci files against the version in .github/xorq-ci.rev.
+# No `paths:` filter on purpose: a required check skipped by a path filter
+# stays pending and blocks the merge.
+name: ci-workflow-audit
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  audit:
+    uses: xorq-labs/xorq-ci/.github/workflows/workflow-audit.yml@XORQ_CI_SHA # XORQ_CI_TAG

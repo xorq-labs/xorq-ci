@@ -1,0 +1,233 @@
+#!/usr/bin/env python3
+"""fixture-test - prove templates/pre-commit-config.yaml passes good code and
+fails each known-bad change.
+
+For each case: copy fixtures/<name> to a scratch dir, `git init`, install the
+template as .pre-commit-config.yaml, apply the case's mutation, stage
+everything, and run pre-commit. The clean fixture must pass both stages; each
+mutation must make its named hook fail. A green run over the clean fixture alone
+would show only that nothing was rejected.
+
+Payloads are inert: the fake secret is random characters in a token's shape,
+generated here so this repo never contains one, and the workflows added only
+`echo`. Nothing here runs a mutated file.
+
+Needs on PATH: git, tofu (the infra layer's tofu-fmt), and either pre-commit or
+uvx. Exit 0 when every case behaves, 1 otherwise.
+"""
+
+from __future__ import annotations
+
+import os
+import secrets
+import shutil
+import string
+import subprocess
+import sys
+import tempfile
+from collections.abc import Callable
+from pathlib import Path
+
+REPO = Path(__file__).resolve().parent.parent
+TEMPLATE = REPO / "templates" / "pre-commit-config.yaml"
+FIXTURE = REPO / "fixtures" / "shell-tofu"
+PRE_COMMIT = (
+    ["pre-commit"] if shutil.which("pre-commit") else ["uvx", "pre-commit@4.6.2"]
+)
+MARK = "<" * 7, "=" * 7, ">" * 7
+
+
+def write(root: Path, rel: str, text: str, mode: int | None = None) -> None:
+    path = root / rel
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(text)
+    if mode is not None:
+        path.chmod(mode)
+
+
+def append(root: Path, rel: str, text: str) -> None:
+    path = root / rel
+    path.write_text(path.read_text() + text)
+
+
+def fake_token() -> str:
+    alphabet = string.ascii_letters + string.digits
+    return "ghp_" + "".join(secrets.choice(alphabet) for _ in range(36))
+
+
+# pre-commit reports an aliased hook under its underlying id.
+REPORTED_ID = {"gitleaks-tree": "gitleaks"}
+
+# (hook id or alias, stage, description, mutation)
+Case = tuple[str, str, str, Callable[[Path], None]]
+CASES: list[Case] = [
+    (
+        "check-merge-conflict",
+        "pre-commit",
+        "committed conflict markers",
+        lambda r: write(
+            r, "notes.txt", f"{MARK[0]} ours\na\n{MARK[1]}\nb\n{MARK[2]} theirs\n"
+        ),
+    ),
+    (
+        "trailing-whitespace",
+        "pre-commit",
+        "trailing spaces",
+        lambda r: append(r, "README.md", "trailing   \n"),
+    ),
+    (
+        "end-of-file-fixer",
+        "pre-commit",
+        "missing final newline",
+        lambda r: write(r, "notes.txt", "no newline"),
+    ),
+    (
+        "check-added-large-files",
+        "pre-commit",
+        "a 600 KB file",
+        lambda r: (r / "big.bin").write_bytes(secrets.token_bytes(600 * 1024)),
+    ),
+    (
+        "check-json",
+        "pre-commit",
+        "trailing comma in JSON",
+        lambda r: write(r, "config/bad.json", '{"a": 1,}\n'),
+    ),
+    (
+        "check-yaml",
+        "pre-commit",
+        "unterminated YAML flow sequence",
+        lambda r: write(r, "config/bad.yaml", "a: [1, 2\n"),
+    ),
+    (
+        "codespell",
+        "pre-commit",
+        "a misspelling",
+        lambda r: append(r, "README.md", "We " + "re" + "cieve it.\n"),
+    ),
+    (
+        "gitleaks",
+        "pre-commit",
+        "a token-shaped string, staged",
+        lambda r: write(
+            r, "scripts/creds.sh", f"#!/usr/bin/env bash\n# {fake_token()}\n", 0o755
+        ),
+    ),
+    (
+        "gitleaks-tree",
+        "manual",
+        "a token-shaped string in the tree",
+        lambda r: write(
+            r, "scripts/creds.sh", f"#!/usr/bin/env bash\n# {fake_token()}\n", 0o755
+        ),
+    ),
+    (
+        "actionlint",
+        "pre-commit",
+        "unknown runner label",
+        lambda r: write(
+            r,
+            ".github/workflows/bad.yml",
+            "on: push\npermissions: {}\njobs:\n  a:\n    runs-on: ubuntu-latst\n"
+            "    steps:\n      - run: echo hi\n",
+        ),
+    ),
+    (
+        "zizmor",
+        "pre-commit",
+        "pull_request_target checking out the PR head",
+        lambda r: write(
+            r,
+            ".github/workflows/prt.yml",
+            "on:\n  pull_request_target:\npermissions: {}\njobs:\n  a:\n"
+            "    runs-on: ubuntu-latest\n    steps:\n"
+            "      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1\n"
+            "        with:\n          ref: ${{ github.event.pull_request.head.sha }}\n"
+            "          persist-credentials: false\n      - run: echo hi\n",
+        ),
+    ),
+    (
+        "shellcheck",
+        "pre-commit",
+        "unquoted expansion in an extensionless script",
+        lambda r: append(r, "bin/tool", "ls $1\n"),
+    ),
+    (
+        "shfmt",
+        "pre-commit",
+        "misindented shell",
+        lambda r: append(r, "scripts/run.sh", "if true; then\n      echo x\nfi\n"),
+    ),
+    (
+        "tofu-fmt",
+        "pre-commit",
+        "misindented OpenTofu",
+        lambda r: write(r, "infra/bad.tf", 'variable "x" {\n      type = string\n}\n'),
+    ),
+]
+
+
+def prepare(scratch: Path) -> Path:
+    root = scratch / "repo"
+    shutil.copytree(FIXTURE, root, symlinks=True)
+    shutil.copy(TEMPLATE, root / ".pre-commit-config.yaml")
+    env = {"GIT_CONFIG_GLOBAL": os.devnull, "GIT_CONFIG_SYSTEM": os.devnull}
+    run(["git", "init", "-q", "-b", "main"], root, env)
+    run(["git", "config", "user.email", "fixture@example.invalid"], root, env)
+    run(["git", "config", "user.name", "fixture"], root, env)
+    return root
+
+
+def run(
+    cmd: list[str], cwd: Path, extra: dict[str, str] | None = None
+) -> subprocess.CompletedProcess[str]:
+    env = {**os.environ, **(extra or {})}
+    return subprocess.run(
+        cmd, cwd=cwd, env=env, capture_output=True, text=True, check=False
+    )
+
+
+def pre_commit(
+    root: Path, stage: str, hook: str | None = None
+) -> subprocess.CompletedProcess[str]:
+    run(["git", "add", "-A"], root)
+    cmd = [*PRE_COMMIT, "run", "--all-files", "--hook-stage", stage]
+    if hook:
+        cmd.insert(len(PRE_COMMIT) + 1, hook)
+    return run(cmd, root)
+
+
+def main() -> int:
+    failures = 0
+    with tempfile.TemporaryDirectory(prefix="xorq-ci-fixture-") as tmp:
+        scratch = Path(tmp)
+        clean = prepare(scratch / "clean")
+        for stage in ("pre-commit", "manual"):
+            proc = pre_commit(clean, stage)
+            ok = proc.returncode == 0
+            failures += not ok
+            print(f"{'ok  ' if ok else 'FAIL'} clean fixture passes the {stage} stage")
+            if not ok:
+                print(proc.stdout + proc.stderr)
+        for index, (hook, stage, what, mutate) in enumerate(CASES):
+            root = prepare(scratch / f"case-{index}")
+            mutate(root)
+            proc = pre_commit(root, stage, hook)
+            out = proc.stdout + proc.stderr
+            # Nonzero is not enough: a hook that crashed installing also exits
+            # nonzero. Require pre-commit's own report that THIS hook failed.
+            ok = (
+                proc.returncode != 0
+                and f"- hook id: {REPORTED_ID.get(hook, hook)}" in out
+                and "An unexpected error has occurred" not in out
+            )
+            failures += not ok
+            print(f"{'ok  ' if ok else 'FAIL'} {hook} rejects {what}")
+            if not ok:
+                print(proc.stdout + proc.stderr)
+    print(f"{len(CASES) + 2 - failures}/{len(CASES) + 2} fixture checks behaved")
+    return 1 if failures else 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

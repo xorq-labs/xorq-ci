@@ -1,0 +1,84 @@
+# Reusable: run the caller repo's own .pre-commit-config.yaml, so CI and local
+# commits run the same checks. Two passes: the commit-time hooks, then the
+# manual-stage hooks (the CI-only checks, such as the whole-tree secret scan).
+name: lint
+
+on:
+  workflow_call:
+    inputs:
+      pre-steps:
+        description: Shell run before pre-commit, e.g. building an extension that hooks import.
+        type: string
+        default: ""
+      skip-hooks:
+        description: Comma-separated hook ids to skip (pre-commit's SKIP).
+        type: string
+        default: ""
+      python-version:
+        description: Python used for pre-commit and python-language hooks.
+        type: string
+        default: "3.13"
+
+permissions:
+  contents: read
+
+jobs:
+  pre-commit:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7 # v10.2.0
+        with:
+          python-version: ${{ inputs.python-version }}
+          enable-cache: false
+
+      # actionlint checks `run:` scripts only when shellcheck is on PATH.
+      - name: Put shellcheck on PATH
+        run: |
+          uv tool install shellcheck-py==0.11.0.1
+          uv tool dir --bin >> "$GITHUB_PATH"
+
+      # The repo's OpenTofu pin, if it has one, is the file itself.
+      - name: Detect OpenTofu pin
+        id: tofu
+        run: |
+          if [ -f .opentofu-version ]; then echo "pinned=true" >> "$GITHUB_OUTPUT"; fi
+      - if: steps.tofu.outputs.pinned == 'true'
+        uses: opentofu/setup-opentofu@a1320f892987e89d278cc92dc5adc984fb93aca4 # v2.0.2
+        with:
+          tofu_version_file: .opentofu-version
+          tofu_wrapper: false
+
+      # Pull requests only read the cache; the default branch writes it.
+      - id: cache
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ~/.cache/pre-commit
+          key: pre-commit-${{ runner.os }}-${{ inputs.python-version }}-${{ hashFiles('.pre-commit-config.yaml') }}
+
+      - name: Pre-steps
+        if: inputs.pre-steps != ''
+        env:
+          PRE_STEPS: ${{ inputs.pre-steps }}
+        run: bash -euo pipefail -c "$PRE_STEPS"
+
+      - name: pre-commit (commit-time hooks)
+        env:
+          SKIP: ${{ inputs.skip-hooks }}
+        run: uvx pre-commit@4.6.2 run --all-files --show-diff-on-failure
+
+      - name: pre-commit (manual-stage hooks)
+        if: success() || failure()
+        env:
+          SKIP: ${{ inputs.skip-hooks }}
+        run: uvx pre-commit@4.6.2 run --all-files --show-diff-on-failure --hook-stage manual
+
+      - if: always() && steps.cache.outputs.cache-hit != 'true' && github.ref == format('refs/heads/{0}', github.event.repository.default_branch)
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ~/.cache/pre-commit
+          key: ${{ steps.cache.outputs.cache-primary-key }}

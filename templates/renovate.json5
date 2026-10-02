@@ -1,0 +1,8 @@
+// xorq-ci: managed templates/renovate.json5
+//
+// Copy to .github/renovate.json5. The policy lives in xorq-ci's preset; this
+// file only points at it. The preset follows xorq-ci's default branch.
+{
+  $schema: 'https://docs.renovatebot.com/renovate-schema.json',
+  extends: ['github>xorq-labs/xorq-ci//renovate/default'],
+}

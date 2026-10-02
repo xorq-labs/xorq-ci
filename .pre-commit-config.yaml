@@ -1,0 +1,90 @@
+# xorq-ci: forked templates/pre-commit-config.yaml
+#
+# xorq-ci's own hooks: the template plus ruff for bin/ and dev/ (Python).
+# fixtures/ holds the template's test repo; dev/fixture-test runs the
+# template against it, so this config leaves it alone.
+default_stages: [pre-commit]
+exclude: ^fixtures/
+repos:
+  # --- core ------------------------------------------------------------------
+  - repo: https://github.com/pre-commit/pre-commit-hooks
+    rev: v6.0.0
+    hooks:
+      # Without --assume-in-merge the hook checks only during a merge, so a
+      # committed conflict marker passes CI.
+      - id: check-merge-conflict
+        args: [--assume-in-merge]
+      - id: trailing-whitespace
+      - id: end-of-file-fixer
+      - id: check-added-large-files
+        # Without --enforce-all only newly added files are checked, which is
+        # nothing in a CI run over committed files.
+        args: [--maxkb=500, --enforce-all]
+      - id: check-json
+      - id: check-yaml
+  - repo: https://github.com/codespell-project/codespell
+    rev: v2.4.3
+    hooks:
+      - id: codespell
+  # Alternative spell checker (which one is the default is still open):
+  # - repo: https://github.com/crate-ci/typos
+  #   rev: v1.50.3
+  #   hooks:
+  #     - id: typos
+  - repo: https://github.com/gitleaks/gitleaks
+    rev: v8.30.1
+    hooks:
+      # The upstream hook scans staged changes only, so it checks nothing in a
+      # CI run of --all-files. The second entry scans the checked-out tree; it
+      # is manual-stage because locally it would also read gitignored secrets.
+      - id: gitleaks
+      - id: gitleaks
+        alias: gitleaks-tree
+        name: Detect hardcoded secrets (whole tree)
+        entry: gitleaks dir --redact --verbose .
+        stages: [manual]
+  - repo: https://github.com/rhysd/actionlint
+    rev: v1.7.12
+    hooks:
+      # Runs shellcheck on `run:` scripts only when shellcheck is on PATH.
+      # lint.yml puts it there; locally, install shellcheck to get the same.
+      - id: actionlint
+  - repo: https://github.com/zizmorcore/zizmor-pre-commit
+    rev: v1.30.1
+    hooks:
+      - id: zizmor
+
+  # --- shell -----------------------------------------------------------------
+  # Both hooks select files by `types: [shell]`, which pre-commit infers from
+  # the extension or, for an extensionless file, from the shebang of an
+  # executable file. Keep scripts in bin/ executable.
+  - repo: https://github.com/shellcheck-py/shellcheck-py
+    rev: v0.11.0.1
+    hooks:
+      - id: shellcheck
+  - repo: https://github.com/scop/pre-commit-shfmt
+    rev: v3.14.1-1
+    hooks:
+      # --diff reports instead of rewriting; replace with [--write] to fix.
+      - id: shfmt
+        args: [--diff]
+
+  # --- infra -----------------------------------------------------------------
+  # Needs tofu on PATH. lint.yml installs it when the repo has an
+  # .opentofu-version file, the single pin for the OpenTofu version.
+  - repo: local
+    hooks:
+      - id: tofu-fmt
+        name: tofu fmt
+        entry: tofu fmt -check -diff -recursive
+        language: system
+        files: \.(tf|tofu|tfvars)$
+        pass_filenames: false
+
+  # --- python ----------------------------------------------------------------
+  - repo: https://github.com/astral-sh/ruff-pre-commit
+    rev: v0.16.10
+    hooks:
+      - id: ruff-check
+      - id: ruff-format
+        args: [--check]

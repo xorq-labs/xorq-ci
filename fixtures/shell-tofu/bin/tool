@@ -1,0 +1,5 @@
+#!/usr/bin/env bash
+# Extensionless on purpose: pre-commit must find it by its shebang.
+set -euo pipefail
+name="${1:-world}"
+printf 'hello, %s\n' "$name"

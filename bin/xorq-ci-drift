@@ -1,0 +1,237 @@
+#!/usr/bin/env python3
+"""xorq-ci-drift - compare a consumer repo's copied xorq-ci files with upstream.
+
+The consumer records the xorq-ci version it uses in ONE file,
+`.github/xorq-ci.rev`, holding a tag and its commit sha on one line:
+
+    v0.1.0 0123456789abcdef0123456789abcdef01234567
+
+Copied files say where they came from on one of their first three lines:
+
+    # xorq-ci: managed templates/workflows/ci-lint.yml
+    // xorq-ci: forked templates/renovate.json5
+
+`managed` means identical to upstream at the recorded sha (after rendering the
+XORQ_CI_SHA / XORQ_CI_TAG placeholders), and a difference fails the check.
+`forked` means started from upstream and changed on purpose: the diff is
+reported, never failed.
+
+Every `uses: xorq-labs/xorq-ci/...@<ref>` in .github/workflows must name the
+recorded sha, so the rev file and the workflow refs cannot diverge.
+
+Subcommands:
+    check   (default) report drift; exit 0 clean, 1 drift, 2 could not run
+    update  rewrite managed files from upstream at the recorded sha
+    copy    render one template into the repo: copy <template-path> <dest>
+
+Upstream is read with git: --upstream names a local clone or a URL
+(default: $XORQ_CI_UPSTREAM, else https://github.com/xorq-labs/xorq-ci.git).
+A URL is fetched into a bare cache under $XDG_CACHE_HOME/xorq-ci.
+"""
+
+from __future__ import annotations
+
+import argparse
+import difflib
+import os
+import re
+import subprocess
+import sys
+from pathlib import Path
+
+DEFAULT_UPSTREAM = "https://github.com/xorq-labs/xorq-ci.git"
+REV_FILE = Path(".github/xorq-ci.rev")
+REV_RE = re.compile(r"^(v\d+\.\d+\.\d+) ([0-9a-f]{40})\s*$")
+HEADER_RE = re.compile(r"^(?:#|//) xorq-ci: (managed|forked) (\S+)\s*$")
+USES_RE = re.compile(r"uses:\s*['\"]?xorq-labs/xorq-ci/([^@\s'\"]+)@([^\s'\"#]+)")
+HEADER_LINES = 3
+
+
+class CannotRun(Exception):
+    """The check could not complete; maps to exit 2."""
+
+
+def git(*args: str, cwd: Path | None = None) -> str:
+    proc = subprocess.run(
+        ["git", *args], cwd=cwd, capture_output=True, text=True, check=False
+    )
+    if proc.returncode != 0:
+        raise CannotRun(f"git {' '.join(args)}: {proc.stderr.strip()}")
+    return proc.stdout
+
+
+def read_rev(root: Path) -> tuple[str, str]:
+    path = root / REV_FILE
+    if not path.is_file():
+        raise CannotRun(f"{REV_FILE} not found under {root}")
+    match = REV_RE.match(path.read_text())
+    if not match:
+        raise CannotRun(f"{REV_FILE} must be one line '<vX.Y.Z> <40-hex sha>'")
+    return match.group(1), match.group(2)
+
+
+class Upstream:
+    """Reads files from xorq-ci at a fixed sha."""
+
+    def __init__(self, source: str, sha: str) -> None:
+        self.sha = sha
+        local = Path(source)
+        if local.is_dir():
+            self.gitdir = local
+        else:
+            cache = (
+                Path(os.environ.get("XDG_CACHE_HOME", Path.home() / ".cache"))
+                / "xorq-ci"
+                / "upstream.git"
+            )
+            if not cache.is_dir():
+                cache.parent.mkdir(parents=True, exist_ok=True)
+                git("init", "--bare", "-q", str(cache))
+            git("fetch", "-q", "--depth=1", source, sha, cwd=cache)
+            self.gitdir = cache
+        try:
+            git("cat-file", "-e", f"{sha}^{{commit}}", cwd=self.gitdir)
+        except CannotRun as exc:
+            raise CannotRun(f"upstream has no commit {sha}") from exc
+
+    def read(self, path: str) -> str | None:
+        proc = subprocess.run(
+            ["git", "show", f"{self.sha}:{path}"],
+            cwd=self.gitdir,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        return proc.stdout if proc.returncode == 0 else None
+
+
+def render(text: str, tag: str, sha: str) -> str:
+    return text.replace("XORQ_CI_SHA", sha).replace("XORQ_CI_TAG", tag)
+
+
+def header(text: str) -> tuple[str, str] | None:
+    for line in text.splitlines()[:HEADER_LINES]:
+        match = HEADER_RE.match(line)
+        if match:
+            return match.group(1), match.group(2)
+    return None
+
+
+def tracked_files(root: Path) -> list[Path]:
+    out = git("ls-files", "-z", cwd=root)
+    return [root / name for name in out.split("\0") if name]
+
+
+def as_managed(text: str) -> str:
+    return re.sub(
+        r"^((?:#|//) xorq-ci: )forked ",
+        r"\1managed ",
+        text,
+        count=1,
+        flags=re.MULTILINE,
+    )
+
+
+def unified(a: str, b: str, a_name: str, b_name: str) -> str:
+    return "".join(
+        difflib.unified_diff(
+            a.splitlines(keepends=True),
+            b.splitlines(keepends=True),
+            fromfile=a_name,
+            tofile=b_name,
+        )
+    )
+
+
+def check(root: Path, upstream: Upstream, tag: str, update: bool) -> int:
+    failed = False
+    for path in tracked_files(root):
+        rel = path.relative_to(root)
+        try:
+            text = path.read_text()
+        except (UnicodeDecodeError, IsADirectoryError, FileNotFoundError):
+            continue
+        found = header(text)
+        if not found:
+            continue
+        mode, source = found
+        raw = upstream.read(source)
+        if raw is None:
+            print(f"FAIL {rel}: {source} does not exist upstream at {upstream.sha}")
+            failed = True
+            continue
+        expected = render(raw, tag, upstream.sha)
+        if mode == "managed":
+            if text == expected:
+                print(f"ok   {rel} (managed)")
+            elif update:
+                path.write_text(expected)
+                print(f"UPD  {rel} rewritten from {source}@{tag}")
+            else:
+                print(f"FAIL {rel}: managed copy differs from {source}@{tag}")
+                print(unified(expected, text, f"upstream/{source}", str(rel)))
+                failed = True
+        else:
+            diff = unified(expected, as_managed(text), f"upstream/{source}", str(rel))
+            changed = sum(
+                1
+                for line in diff.splitlines()
+                if line[:1] in "+-" and not line.startswith(("+++", "---"))
+            )
+            print(f"info {rel} (forked from {source}): {changed} changed lines")
+    workflows = root / ".github" / "workflows"
+    for path in sorted(workflows.glob("*.y*ml")) if workflows.is_dir() else []:
+        for lineno, line in enumerate(path.read_text().splitlines(), 1):
+            match = USES_RE.search(line)
+            if match and match.group(2) != upstream.sha:
+                print(
+                    f"FAIL {path.relative_to(root)}:{lineno}: uses "
+                    f"xorq-ci@{match.group(2)}, but {REV_FILE} records {upstream.sha}"
+                )
+                failed = True
+    return 1 if failed else 0
+
+
+def copy(
+    root: Path, upstream: Upstream, tag: str, template: str, dest: str, force: bool
+) -> int:
+    raw = upstream.read(template)
+    if raw is None:
+        raise CannotRun(f"{template} does not exist upstream at {upstream.sha}")
+    target = root / dest
+    if target.exists() and not force:
+        raise CannotRun(f"{dest} exists; pass --force to overwrite")
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_text(render(raw, tag, upstream.sha))
+    print(f"wrote {dest} from {template}@{tag}")
+    return 0
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
+    parser.add_argument(
+        "command", nargs="?", default="check", choices=["check", "update", "copy"]
+    )
+    parser.add_argument("args", nargs="*", help="copy: <template-path> <dest>")
+    parser.add_argument("--root", default=".", help="consumer repo root (default: .)")
+    parser.add_argument(
+        "--upstream", default=os.environ.get("XORQ_CI_UPSTREAM", DEFAULT_UPSTREAM)
+    )
+    parser.add_argument("--force", action="store_true", help="copy: overwrite dest")
+    opts = parser.parse_args(argv)
+    try:
+        root = Path(opts.root).resolve()
+        tag, sha = read_rev(root)
+        upstream = Upstream(opts.upstream, sha)
+        if opts.command == "copy":
+            if len(opts.args) != 2:
+                raise CannotRun("usage: xorq-ci-drift copy <template-path> <dest>")
+            return copy(root, upstream, tag, *opts.args, force=opts.force)
+        return check(root, upstream, tag, update=opts.command == "update")
+    except CannotRun as exc:
+        print(f"xorq-ci-drift: {exc}", file=sys.stderr)
+        return 2
+
+
+if __name__ == "__main__":
+    sys.exit(main())
