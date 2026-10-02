@@ -1,1 +1,5 @@
 .kata.local.toml
+# devcontainer worktree overlay (new-worktree / setup-worktree)
+/.claude/container-audit
+/.claude/container-sessions
+/.envrcs/.worktree-manifest

@@ -1,0 +1,45 @@
+# Reusable: check the caller's copied xorq-ci files against xorq-ci at the
+# version recorded in .github/xorq-ci.rev, and that every `uses:` ref to
+# xorq-ci names that same sha. actionlint and zizmor run in lint.yml, as
+# hooks in the caller's pre-commit config; this job holds what needs network.
+name: workflow-audit
+
+on:
+  workflow_call:
+    inputs:
+      upstream-repository:
+        description: Where xorq-ci lives (override only for testing a fork).
+        type: string
+        default: xorq-labs/xorq-ci
+
+permissions:
+  contents: read
+
+jobs:
+  drift:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Read .github/xorq-ci.rev
+        id: rev
+        run: |
+          read -r tag sha < .github/xorq-ci.rev
+          if ! [[ "$tag" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ && "$sha" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "::error file=.github/xorq-ci.rev::expected one line '<vX.Y.Z> <40-hex sha>'"
+            exit 1
+          fi
+          echo "sha=$sha" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: ${{ inputs.upstream-repository }}
+          ref: ${{ steps.rev.outputs.sha }}
+          path: .xorq-ci-upstream
+          persist-credentials: false
+
+      - name: xorq-ci-drift check
+        run: python3 .xorq-ci-upstream/bin/xorq-ci-drift check --upstream .xorq-ci-upstream

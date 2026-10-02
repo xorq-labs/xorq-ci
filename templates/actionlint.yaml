@@ -1,0 +1,8 @@
+# xorq-ci: managed templates/actionlint.yaml
+#
+# Copy to .github/actionlint.yaml. Declares the org's self-hosted runner
+# labels so actionlint does not report them as unknown. A repo with other
+# labels adds them here and marks the file forked.
+self-hosted-runner:
+  labels:
+    - bigger-runner

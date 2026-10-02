@@ -1,0 +1,28 @@
+{
+  "$schema": "https://docs.renovatebot.com/renovate-schema.json",
+  "description": "xorq-ci preset: actions pinned to SHAs with version comments, pre-commit revs bumped, and the xorq-ci version bumped as one group",
+  "extends": [
+    "config:recommended",
+    ":enablePreCommit",
+    "helpers:pinGitHubActionDigestsToSemver",
+    "schedule:monthly"
+  ],
+  "customManagers": [
+    {
+      "customType": "regex",
+      "description": "The xorq-ci version this repo consumes: .github/xorq-ci.rev holds '<tag> <sha>'",
+      "managerFilePatterns": ["/(^|/)\\.github/xorq-ci\\.rev$/"],
+      "matchStrings": ["^(?<currentValue>v\\d+\\.\\d+\\.\\d+) (?<currentDigest>[0-9a-f]{40})\\s*$"],
+      "datasourceTemplate": "github-tags",
+      "depNameTemplate": "xorq-labs/xorq-ci"
+    }
+  ],
+  "packageRules": [
+    {
+      "description": "Bump the rev file and every uses: ref to xorq-ci in one PR, outside the monthly schedule",
+      "matchPackageNames": ["xorq-labs/xorq-ci"],
+      "groupName": "xorq-ci",
+      "schedule": ["at any time"]
+    }
+  ]
+}
